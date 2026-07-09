@@ -4,6 +4,7 @@
 import express from 'express';
 import cors from 'cors';
 import { MongoClient, ServerApiVersion } from 'mongodb';
+import { fileURLToPath } from 'node:url';
 
 const PORT = process.env.PORT || 4000;
 const URI = process.env.MONGODB_URI;
@@ -57,6 +58,44 @@ const store = {
     else mem.profiles[a] = next;
     return next;
   },
+  // Spending analytics over completed transactions — backs the "VAT reclaimable"
+  // tile and the category spending breakdown in the tourist app.
+  async stats() {
+    const rows = mongo
+      ? await mongo.collection('transactions').find({}).toArray()
+      : [...mem.transactions];
+    const round2 = (n) => Math.round(n * 100) / 100;
+    const byCategory = {};
+    const byToken = {};
+    let totalSpentAED = 0;
+    let totalVatAED = 0;
+    let txCount = 0;
+
+    for (const t of rows) {
+      if ((t.status || 'completed') !== 'completed') continue; // only settled spend counts
+      const amt = Number(t.amountAED) || 0;
+      const vat = Number(t.vatAED) || 0;
+      totalSpentAED += amt;
+      totalVatAED += vat;
+      txCount += 1;
+
+      const cat = t.category || 'Other';
+      byCategory[cat] = byCategory[cat] || { count: 0, amountAED: 0 };
+      byCategory[cat].count += 1;
+      byCategory[cat].amountAED = round2(byCategory[cat].amountAED + amt);
+
+      const tok = t.token || 'AED';
+      byToken[tok] = round2((byToken[tok] || 0) + amt);
+    }
+
+    return {
+      txCount,
+      totalSpentAED: round2(totalSpentAED),
+      totalVatAED: round2(totalVatAED),
+      byCategory,
+      byToken,
+    };
+  },
 };
 
 async function connectMongo() {
@@ -78,7 +117,7 @@ async function connectMongo() {
   }
 }
 
-const app = express();
+export const app = express();
 app.use(cors());
 app.use(express.json());
 
@@ -86,9 +125,23 @@ app.get('/health', (_req, res) => res.json({ ok: true, store: mongo ? 'mongodb' 
 app.get('/rates', (_req, res) => res.json({ ...RATES, updatedAt: Date.now() }));
 app.get('/transactions', async (_req, res) => res.json(await store.listTx()));
 app.post('/transactions', async (req, res) => res.json(await store.addTx(req.body || {})));
+app.get('/stats', async (_req, res) => res.json({ ...(await store.stats()), updatedAt: Date.now() }));
 app.get('/profile/:address', async (req, res) => res.json(await store.getProfile(req.params.address)));
 app.put('/profile/:address', async (req, res) => res.json(await store.putProfile(req.params.address, req.body || {})));
 
-connectMongo().finally(() => {
-  app.listen(PORT, () => console.log(`[api] Safwah API on http://localhost:${PORT} (store: ${mongo ? 'mongodb' : 'memory'})`));
-});
+// Exposed for tests: the store, the peg rates, the default profile shape, and a
+// helper to reset the in-memory store between test cases.
+export { store, RATES, DEFAULT_PROFILE };
+export function resetMemory() {
+  mem.transactions = [...SEED_TX];
+  for (const key of Object.keys(mem.profiles)) delete mem.profiles[key];
+}
+
+// Start the server only when run directly (`node index.js`), not when a test
+// imports this module — so tests never open a port or reach out to MongoDB.
+const invokedDirectly = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (invokedDirectly) {
+  connectMongo().finally(() => {
+    app.listen(PORT, () => console.log(`[api] Safwah API on http://localhost:${PORT} (store: ${mongo ? 'mongodb' : 'memory'})`));
+  });
+}
